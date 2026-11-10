@@ -643,7 +643,7 @@
     if (!dst) { toast(d.name + ' nemá IP adresu.', 'warn'); return; }
     runPing(src, dst.ip, d);
   }
-  const REASONS = { arp: 'ARP bez odpovědi (cíl/brána není v L2 síti)', unreachable: 'Cíl nedostupný (chybí trasa na routeru)', 'noroute-src': 'Zdroj nemá trasu ani výchozí bránu', ttl: 'Vypršelo TTL (smyčka?)', drop: 'Zařízení nesměruje (vypnutý routing)', noreply: 'Odpověď se nevrátila zpět', badip: 'Neplatná IP', loop: 'Směrovací smyčka' };
+  const REASONS = { acl: 'Zablokováno access-listem (ACL)', arp: 'ARP bez odpovědi (cíl/brána není v L2 síti)', unreachable: 'Cíl nedostupný (chybí trasa na routeru)', 'noroute-src': 'Zdroj nemá trasu ani výchozí bránu', ttl: 'Vypršelo TTL (smyčka?)', drop: 'Zařízení nesměruje (vypnutý routing)', noreply: 'Odpověď se nevrátila zpět', badip: 'Neplatná IP', loop: 'Směrovací smyčka' };
   function runPing(src, dstIp, dstDev) {
     const r = S.sim.ping(src, dstIp);
     const row = { id: S.pdus.length + 1, src: src.name, dst: (dstDev ? dstDev.name + ' ' : '') + dstIp, ok: r.ok, reason: r.ok ? '' : (REASONS[r.reason] || r.reason) + (r.from && !r.ok ? ` @ ${r.from.name}` : ''), t: new Date() };

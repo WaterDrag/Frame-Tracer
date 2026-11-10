@@ -121,7 +121,8 @@
       defaultGateway: '', ipRouting: false, domainName: '',
       vlans: { 1: 'default' }, routes: [], rip: null, ospf: [], eigrp: [],
       lines: { con: { password: '', login: false, extra: [] }, vty: { password: '', login: false, extra: [], range: '0 4' } },
-      dhcpPools: [], dhcpExcluded: [], users: [], extra: [], version: dev.kind === 'router' ? '15.1' : '15.0'
+      dhcpPools: [], dhcpExcluded: [], users: [], extra: [],
+      acls: [], nat: { statics: [], dynamics: [], pools: [] }, stp: {}, stpMode: 'pvst', rsaBits: 0, sshVersion: 0, version: dev.kind === 'router' ? '15.1' : '15.0'
     };
   }
   function createDevice(model, x, y, existingNames) {
@@ -197,11 +198,8 @@
               to64((f[4] << 16) | (f[10] << 8) | f[5], 4) + to64(f[11], 2);
     return '$1$' + salt.slice(0, 8) + '$' + h;
   }
-  function makeSecret(pw) {
-    const it = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-    let salt = ''; for (let i = 0; i < 4; i++) salt += it[Math.floor(Math.random() * 64)];
-    return md5crypt(pw, salt);
-  }
+  /** Packet Tracer používá vždy sůl „mERr“ – díky tomu jdou hashe porovnat s řešením aktivity */
+  function makeSecret(pw) { return md5crypt(pw, 'mERr'); }
   function checkSecret(pw, hash) {
     const m = String(hash).match(/^\$1\$([^$]*)\$/);
     return m ? md5crypt(pw, m[1]) === hash : pw === hash;
@@ -223,6 +221,94 @@
     if (tokens[0] === '7' && tokens[1]) return type7dec(tokens[1]);
     if (tokens[0] === '0' && tokens[1]) return tokens.slice(1).join(' ');
     return tokens.join(' ');
+  }
+
+  /* ------------------------------ ACL / NAT ------------------------------ */
+  const PORT_NAMES = { 'ftp-data': 20, ftp: 21, ssh: 22, telnet: 23, smtp: 25, domain: 53, dns: 53, bootps: 67, bootpc: 68, tftp: 69, www: 80, http: 80, pop3: 110, ntp: 123, snmp: 161, https: 443 };
+  const portNum = s => { const k = String(s).toLowerCase(); return PORT_NAMES[k] !== undefined ? PORT_NAMES[k] : (/^\d+$/.test(k) ? +k : null); };
+  function aclTypeOf(id) { const n = +id; return /^\d+$/.test(String(id)) ? ((n >= 100 && n <= 199) || (n >= 2000 && n <= 2699) ? 'extended' : 'standard') : null; }
+  function aclFind(cfg, id) { return (cfg.acls || []).find(a => a.id === String(id)) || null; }
+  function aclEnsure(cfg, id, type) {
+    let a = aclFind(cfg, id);
+    if (!a) { a = { id: String(id), type: aclTypeOf(id) || type || 'standard', named: aclTypeOf(id) === null, entries: [] }; cfg.acls.push(a); }
+    return a;
+  }
+  /** tokeny jednoho pravidla -> rozparsované pravidlo (s normalizovaným textem) nebo null */
+  function aclParse(type, tokens) {
+    const t = tokens.map(x => String(x).toLowerCase()); let i = 0;
+    const action = t[i++];
+    if (action === 'remark') return { remark: true, text: 'remark ' + tokens.slice(1).join(' ') };
+    if (action !== 'permit' && action !== 'deny') return null;
+    const addr = () => {
+      const a = t[i];
+      if (a === 'any') { i++; return { any: true, txt: 'any' }; }
+      if (a === 'host') { const ip = t[i + 1]; if (!IP.valid(ip)) return null; i += 2; return { ip, wild: '0.0.0.0', txt: 'host ' + ip }; }
+      if (!IP.valid(a)) return null;
+      i++;
+      if (IP.valid(t[i])) { const w = t[i++]; return w === '0.0.0.0' ? { ip: a, wild: w, txt: 'host ' + a } : { ip: a, wild: w, txt: a + ' ' + w }; }
+      if (type === 'standard') return { ip: a, wild: '0.0.0.0', txt: 'host ' + a };
+      return null;
+    };
+    const port = () => {
+      const op = t[i];
+      if (['eq', 'gt', 'lt', 'neq'].includes(op)) { const n = portNum(t[i + 1]); if (n === null) return undefined; const txt = op + ' ' + t[i + 1]; i += 2; return { op, a: n, txt }; }
+      if (op === 'range') { const a = portNum(t[i + 1]), b = portNum(t[i + 2]); if (a === null || b === null) return undefined; const txt = 'range ' + t[i + 1] + ' ' + t[i + 2]; i += 3; return { op, a, b, txt }; }
+      return null;
+    };
+    if (type === 'standard') { const s = addr(); if (!s) return null; return { action, proto: 'ip', src: s, text: action + ' ' + s.txt }; }
+    const proto = t[i++];
+    if (!['ip', 'icmp', 'tcp', 'udp', 'ospf', 'eigrp'].includes(proto)) return null;
+    const src = addr(); if (!src) return null;
+    const sp = port(); if (sp === undefined) return null;
+    const dst = addr(); if (!dst) return null;
+    const dp = port(); if (dp === undefined) return null;
+    const rest = t.slice(i);
+    return { action, proto, src, sport: sp, dst, dport: dp, rest, text: [action, proto, src.txt, sp && sp.txt, dst.txt, dp && dp.txt, ...rest].filter(Boolean).join(' ') };
+  }
+  function addrOk(spec, ip) { if (spec.any) return true; if (!ip) return false; const w = (~IP.parse(spec.wild)) >>> 0; return ((IP.parse(ip) & w) >>> 0) === ((IP.parse(spec.ip) & w) >>> 0); }
+  function portOk(spec, n) { if (!spec) return true; if (n === null || n === undefined) return false; return spec.op === 'eq' ? n === spec.a : spec.op === 'gt' ? n > spec.a : spec.op === 'lt' ? n < spec.a : spec.op === 'neq' ? n !== spec.a : (n >= spec.a && n <= spec.b); }
+  /** pkt = { src, dst, proto, sport, dport, icmp } -> { action, index } (index -1 = implicitní deny) */
+  function aclMatch(acl, pkt) {
+    for (let i = 0; i < acl.entries.length; i++) {
+      const e = aclParse(acl.type, acl.entries[i].split(/\s+/));
+      if (!e || e.remark) continue;
+      if (e.proto !== 'ip' && e.proto !== pkt.proto) continue;
+      if (!addrOk(e.src, pkt.src)) continue;
+      if (acl.type === 'extended') {
+        if (!addrOk(e.dst, pkt.dst)) continue;
+        if ((e.proto === 'tcp' || e.proto === 'udp') && (!portOk(e.sport, pkt.sport) || !portOk(e.dport, pkt.dport))) continue;
+        if (e.proto === 'icmp' && e.rest[0] && ((e.rest[0] === 'echo' && pkt.icmp !== 'echo') || (e.rest[0] === 'echo-reply' && pkt.icmp !== 'reply'))) continue;
+      }
+      return { action: e.action, index: i };
+    }
+    return { action: 'deny', index: -1 };
+  }
+  /** "ip nat ..." (tokeny za "ip nat") – vrací false, když příkazu nerozumí */
+  function natCommand(cfg, t, neg) {
+    const nat = cfg.nat;
+    if (t[0] === 'pool' && t[1]) {
+      nat.pools = nat.pools.filter(p => p.name !== t[1]);
+      if (!neg) { if (!IP.valid(t[2]) || !IP.valid(t[3])) return false; nat.pools.push({ name: t[1], start: t[2], end: t[3], mask: t[5] || '255.255.255.0' }); }
+      return true;
+    }
+    if (t[0] === 'inside' && t[1] === 'source') {
+      if (t[2] === 'static') {
+        if (!IP.valid(t[3]) || !IP.valid(t[4])) return false;
+        nat.statics = nat.statics.filter(s => !(s.local === t[3] && s.global === t[4]));
+        if (!neg) nat.statics.push({ local: t[3], global: t[4] });
+        return true;
+      }
+      if (t[2] === 'list' && t[3]) {
+        const d = { acl: t[3], overload: t.includes('overload') };
+        if (t[4] === 'interface') d.iface = expandIf(t[5] + (t[6] && /^\d/.test(t[6]) ? t[6] : '')) || t[5];
+        else if (t[4] === 'pool') d.pool = t[5];
+        else return false;
+        nat.dynamics = nat.dynamics.filter(x => x.acl !== d.acl);
+        if (!neg) nat.dynamics.push(d);
+        return true;
+      }
+    }
+    return false;
   }
 
   /* ------------------------- parser konfigu ------------------------ */
@@ -293,7 +379,7 @@
         cfg.bannerMotd = txt.join('\n').trim();
         continue;
       }
-      if (['version', 'end', 'spanning-tree', 'boot-start-marker', 'boot-end-marker', 'license', 'ip cef', 'no ipv6 cef'].includes(k)) continue;
+      if (['version', 'end', 'boot-start-marker', 'boot-end-marker', 'license', 'ip cef', 'no ipv6 cef'].includes(k)) continue;
       if (k === 'service' && t[1] === 'password-encryption') { cfg.servicePwdEnc = true; continue; }
       if (k === 'no' && t[1] === 'service') { if (t[2] === 'password-encryption') cfg.servicePwdEnc = false; continue; }
       if (k === 'service') continue;
@@ -302,14 +388,37 @@
       if (k === 'enable' && t[1] === 'password') { cfg.enablePassword = readPw(t.slice(2)); continue; }
       if (k === 'username') {
         const name = t[1]; const pi = t.indexOf('password') >= 0 ? t.indexOf('password') : t.indexOf('secret');
-        cfg.users.push({ name, raw: b.head, password: pi > 0 ? (t[pi] === 'secret' ? null : readPw(t.slice(pi + 1))) : '' });
+        const u = { name, raw: b.head, password: '' };
+        if (pi > 0 && t[pi] === 'secret') { u.password = null; u.secret = t[pi + 1] === '5' ? t[pi + 2] : makeSecret(t.slice(pi + 1).join(' ')); }
+        else if (pi > 0) u.password = readPw(t.slice(pi + 1));
+        const pv = t.indexOf('privilege'); if (pv > 0) u.privilege = +t[pv + 1];
+        cfg.users.push(u);
         continue;
       }
+      if (k === 'spanning-tree') {
+        if (t[1] === 'mode') cfg.stpMode = t[2] || 'pvst';
+        else if (t[1] === 'vlan' && t[3] === 'priority') { for (const v of parseVlanList(t[2])) cfg.stp[v] = +t[4] || 32768; }
+        else if (t[1] !== 'extend') cfg.extra.push(b.head);
+        continue;
+      }
+      if (k === 'access-list' && t[1]) {
+        const a = aclEnsure(cfg, t[1]); const e = aclParse(a.type, t.slice(2));
+        if (e) a.entries.push(e.text); else cfg.extra.push(b.head);
+        continue;
+      }
+      if (k === 'ip' && t[1] === 'access-list' && t[3]) {
+        const a = aclEnsure(cfg, t[3], t[2]);
+        for (const sub of b.sub) { const e = aclParse(a.type, sub.split(/\s+/)); if (e) a.entries.push(e.text); }
+        continue;
+      }
+      if (k === 'ip' && t[1] === 'nat') { if (!natCommand(cfg, t.slice(2), false)) cfg.extra.push(b.head); continue; }
+      if (k === 'ip' && t[1] === 'ssh' && t[2] === 'version') { cfg.sshVersion = +t[3] || 0; continue; }
       if (k === 'ip' && t[1] === 'domain-name') { cfg.domainName = t[2] || ''; continue; }
       if (k === 'ip' && t[1] === 'routing') { cfg.ipRouting = true; continue; }
       if (k === 'no' && t[1] === 'ip' && t[2] === 'routing') { cfg.ipRouting = false; continue; }
       if (k === 'ip' && t[1] === 'default-gateway') { cfg.defaultGateway = t[2] || ''; continue; }
-      if (k === 'ip' && t[1] === 'classless') continue;
+      if (k === 'ip' && (t[1] === 'classless' || t[1] === 'cef')) continue;
+      if (k === 'no' && t[1] === 'ipv6' && t[2] === 'cef') continue;
       if (k === 'ip' && t[1] === 'flow-export') continue;
       if (k === 'ip' && t[1] === 'route') {
         const r = { net: t[2], mask: t[3] };
@@ -378,7 +487,7 @@
       }
       if (k === 'line') {
         const which = t[1] === 'con' ? 'con' : t[1] === 'vty' ? 'vty' : null;
-        if (!which) { cfg.extra.push(b.head, ...b.sub.map(s => ' ' + s)); continue; }
+        if (!which) { if (t[1] !== 'aux' || b.sub.length) cfg.extra.push(b.head, ...b.sub.map(s => ' ' + s)); continue; }
         const L = cfg.lines[which];
         if (which === 'vty') { L.range = t.slice(2).join(' '); if (cfg.lines.vty2 === undefined && L._seen) { /* druhý blok vty */ } L._seen = true; }
         for (const s of b.sub) {
@@ -469,7 +578,11 @@
     if (dev.kind === 'router') L.push('ip cef', 'no ipv6 cef', '!');
     for (const u of c.users) L.push(u.raw || `username ${u.name} password ${pwOut(c, u.password || '')}`);
     if (c.domainName) L.push(`ip domain-name ${c.domainName}`);
-    if (isSw) L.push('!', 'spanning-tree mode pvst', 'spanning-tree extend system-id');
+    if (c.sshVersion) L.push(`ip ssh version ${c.sshVersion}`);
+    if (isSw) {
+      L.push('!', 'spanning-tree mode ' + (c.stpMode || 'pvst'), 'spanning-tree extend system-id');
+      for (const v of Object.keys(c.stp || {}).map(Number).sort((a, b) => a - b)) if (c.stp[v] !== 32768) L.push('spanning-tree vlan ' + v + ' priority ' + c.stp[v]);
+    }
     if (isSw) {
       const vl = Object.keys(c.vlans).map(Number).filter(v => v !== 1 && !(v >= 1002 && v <= 1005)).sort((a, b) => a - b);
       for (const v of vl) { L.push('!', `vlan ${v}`); if (c.vlans[v] !== 'VLAN' + String(v).padStart(4, '0')) L.push(` name ${c.vlans[v]}`); }
@@ -479,7 +592,7 @@
       if (p.hidden) continue;
       L.push('!', `interface ${p.name}`);
       if (p.desc) L.push(` description ${p.desc}`);
-      const isSwPort = isSw && !p.virtual && !p.noSwitchport;
+      const isSwPort = isSw && (!p.virtual || /^Port-channel/.test(p.name)) && !p.noSwitchport;
       if (isSw && !p.virtual && p.noSwitchport) L.push(' no switchport');
       if (p.encap) L.push(` encapsulation dot1Q ${p.encap}${p.encapNative ? ' native' : ''}`);
       if (isSwPort) {
@@ -517,6 +630,14 @@
     if (c.defaultGateway) L.push(`ip default-gateway ${c.defaultGateway}`);
     L.push('ip classless');
     for (const r of c.routes) L.push(`ip route ${r.net} ${r.mask} ${[r.iface, r.nh].filter(Boolean).join(' ')}${r.ad ? ' ' + r.ad : ''}`);
+    const nat = c.nat || { statics: [], dynamics: [], pools: [] };
+    for (const p of nat.pools) L.push('ip nat pool ' + p.name + ' ' + p.start + ' ' + p.end + ' netmask ' + p.mask);
+    for (const d of nat.dynamics) L.push('ip nat inside source list ' + d.acl + ' ' + (d.iface ? 'interface ' + d.iface : 'pool ' + d.pool) + (d.overload ? ' overload' : ''));
+    for (const st of nat.statics) L.push('ip nat inside source static ' + st.local + ' ' + st.global);
+    for (const a of c.acls || []) {
+      if (a.named) { L.push('ip access-list ' + a.type + ' ' + a.id); for (const e of a.entries) L.push(' ' + e); }
+      else for (const e of a.entries) L.push('access-list ' + a.id + ' ' + e);
+    }
     L.push('!', 'ip flow-export version 9', '!');
     if (c.extra.length) { L.push(...c.extra, '!'); }
     if (c.bannerMotd) { L.push(`banner motd ^C${c.bannerMotd}^C`, '!'); }
@@ -537,7 +658,7 @@
   const api = {
     IP, expandIf, shortIf, ifType, CATALOG, KIND_BY_PTTYPE, HOST_KINDS, IOS_KINDS, uid, randomMac, mediaOf, newPort,
     defaultCfg, createDevice, defaultServices, md5, md5crypt, makeSecret, checkSecret, type7enc, type7dec,
-    parseVlanList, vlanListStr, findPort, ensurePort, applyConfigLines, applyIfLine, generateConfig, IF_TYPES
+    parseVlanList, vlanListStr, findPort, aclFind, aclEnsure, aclParse, aclMatch, aclTypeOf, natCommand, portNum, ensurePort, applyConfigLines, applyIfLine, generateConfig, IF_TYPES
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.NetModel = api;

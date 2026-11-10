@@ -48,6 +48,16 @@
   function importXml(xml, fileName) {
     const doc = X.parse(xml);
     const { top, pt, activity } = netRoot(doc);
+    return importPt(doc, top, pt, activity, fileName);
+  }
+  /** Vzorové řešení aktivity (.pka má uvnitř 2. síť = odpověď) – vrací projekt nebo null */
+  function importAnswer(ctx) {
+    if (!ctx || !ctx.top || ctx.top.name !== 'PACKETTRACER5_ACTIVITY') return null;
+    const pts = X.kids(ctx.top, 'PACKETTRACER5');
+    if (pts.length < 2) return null;
+    try { return importPt(ctx.doc, ctx.top, pts[1], true, 'answer').project; } catch (e) { return null; }
+  }
+  function importPt(doc, top, pt, activity, fileName) {
     const network = X.kid(pt, 'NETWORK');
     const project = {
       version: 1, name: (fileName || 'sit').replace(/\.(pkt|pka|xml)$/i, ''),
@@ -55,7 +65,7 @@
       instructions: null, description: '',
       source: { kind: activity ? 'pka' : 'pkt', fileName: fileName || 'sit.pkt', ptVersion: X.text(X.kid(pt, 'VERSION')) }
     };
-    const ctx = { doc, pt, network, devEl: new Map(), linkEl: new Map(), portEl: new Map(), noteEl: new Map(), skippedRefs: new Set() };
+    const ctx = { doc, top, pt, network, devEl: new Map(), linkEl: new Map(), portEl: new Map(), noteEl: new Map(), skippedRefs: new Set() };
 
     // popis / instrukce
     const desc = X.kid(network, 'DESCRIPTION');
@@ -127,6 +137,8 @@
         }
         if (kind === 'router') for (const p of dev.ports) if (!p.hidden) p.shutdown = true;
         NM.applyConfigLines(dev, rcLines);
+        const secEl = X.kid(eng, 'SECURITY');
+        if (secEl) dev.cfg.rsaBits = +X.text(X.kid(secEl, 'MODULUS_BITS')) || 0;
         if ((kind === 'switch' || kind === 'l3switch') && !NM.findPort(dev, 'Vlan1')) dev.ports.push(NM.newPort('Vlan1', { shutdown: true }));
         const sc = X.kid(eng, 'STARTUPCONFIG');
         const scLines = sc ? X.kids(sc, 'LINE').map(l => X.text(l)) : [];
@@ -312,7 +324,7 @@
     return { xml: X.serialize(ctx.doc), warnings };
   }
 
-  const api = { importXml, exportXml };
+  const api = { importXml, exportXml, importAnswer };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.PTFormat = api;
 })(typeof self !== 'undefined' ? self : this);

@@ -14,10 +14,10 @@
     constructor(project) { this.setProject(project); }
     setProject(project) {
       this.p = project;
-      this.rt = { arp: new Map(), mac: new Map(), leases: new Map() };
+      this.rt = { arp: new Map(), mac: new Map(), leases: new Map(), aclHits: new Map(), nat: new Map(), psec: new Map(), errdis: new Set() };
       this.touch();
     }
-    touch() { this._idx = null; this._dyn = null; }
+    touch() { this._idx = null; this._dyn = null; this._stp = null; }
 
     /* ----------------------------- indexy ----------------------------- */
     index() {
@@ -44,6 +44,7 @@
       if (!pa || !pb) return { up: false, reason: 'chybí port' };
       if (l.cable === 'console') return { up: true, console: true, reason: 'konzolový kabel' };
       if (da.power === false || db.power === false) return { up: false, reason: 'zařízení je vypnuté' };
+      if (this.rt.errdis.has(l.a.dev + '|' + pa.name) || this.rt.errdis.has(l.b.dev + '|' + pb.name)) return { up: false, reason: 'port je err-disabled (porušení port-security) – oprav příčinu a dej shutdown / no shutdown' };
       if (pa.shutdown || pb.shutdown) return { up: false, reason: 'port je administrativně vypnutý (shutdown)' };
       const sa = pa.media === 'serial', sb = pb.media === 'serial';
       if (l.cable === 'serial' || sa || sb) {
@@ -64,7 +65,7 @@
     /** Fyzický port je "up/up"? */
     physUp(d, p) {
       if (!p || d.power === false) return false;
-      if (p.shutdown) return false;
+      if (p.shutdown || this.rt.errdis.has(d.id + '|' + p.name)) return false;
       const lk = this.linkOf(d.id, p.name);
       if (!lk) return false;
       const st = this.linkState(lk.link);
@@ -73,6 +74,7 @@
     /** Provozní stav rozhraní (včetně virtuálních) -> { status, protocol } jako v IOS */
     ifStatus(d, p) {
       if (p.shutdown) return { status: 'administratively down', protocol: 'down', up: false };
+      if (this.rt.errdis.has(d.id + '|' + p.name)) return { status: 'err-disabled', protocol: 'down', up: false };
       if (d.power === false) return { status: 'down', protocol: 'down', up: false };
       const t = NM.ifType(p.name);
       if (t === 'Loopback') return { status: 'up', protocol: 'up', up: true };
@@ -158,6 +160,7 @@
         for (const q of d.ports) {
           if (q.name === inPort || q.virtual || !this.isSwitchPort(d, q)) continue;
           if (!this.physUp(d, q) || !this.carriesVlan(d, q, v)) continue;
+          if (this.stpBlocked(d, q, v)) continue;
           const m = this.effMode(d, q);
           const tag = m === 'access' ? null : (v === (q.native || 1) ? null : v);
           emitOutPort(d, q.name, tag, path.concat({ dev: d.id, in: inPort, out: q.name, vlan: v }));
@@ -191,6 +194,8 @@
           if (m === 'access') { if (tag !== null && tag !== undefined) continue; v = p.vlan || 1; }
           else { v = tag === null || tag === undefined ? (p.native || 1) : tag; if (!this.allowed(p, v)) continue; }
           if (!d.cfg || !d.cfg.vlans[v]) continue; // VLAN neexistuje -> port neaktivní
+          if (this.stpBlocked(d, p, v)) continue;
+          if (src.mac && !this.psecAllow(d, p, src.mac)) continue;
           switchForward(d, pn, v, path);
           continue;
         }
@@ -351,9 +356,9 @@
     /* --------------------------------- ARP / MAC -------------------------------- */
     arpTable(d) { if (!this.rt.arp.has(d.id)) this.rt.arp.set(d.id, new Map()); return this.rt.arp.get(d.id); }
     macTable(d) { if (!this.rt.mac.has(d.id)) this.rt.mac.set(d.id, new Map()); return this.rt.mac.get(d.id); }
-    learn(fromIf, toIf, path) {
+    learn(fromIf, toIf, path, nhIp) {
       if (toIf) {
-        this.arpTable(fromIf.dev).set(toIf.ip, { mac: toIf.mac, iface: fromIf.name });
+        this.arpTable(fromIf.dev).set(nhIp || toIf.ip, { mac: toIf.mac, iface: fromIf.name });
         this.arpTable(toIf.dev).set(fromIf.ip, { mac: fromIf.mac, iface: toIf.name });
       }
       for (const h of path) {
@@ -366,68 +371,232 @@
     }
     clearArp(d) { this.arpTable(d).clear(); }
 
+    /* ------------------------------ STP ------------------------------ */
+    /** Spanning tree pro VLAN v -> { state: Map("dev|port" -> root|desg|altn), info: Map(devId -> {...}) } */
+    stp(v) {
+      if (!this._stp) this._stp = new Map();
+      if (this._stp.has(v)) return this._stp.get(v);
+      const state = new Map(), info = new Map(), out = { state, info };
+      this._stp.set(v, out);
+      const sws = this.p.devices.filter(d => (d.kind === 'switch' || d.kind === 'l3switch') && d.power !== false && d.cfg && d.cfg.vlans[v]);
+      const swSet = new Set(sws.map(d => d.id));
+      const bidCache = new Map();
+      const bid = d => {
+        if (bidCache.has(d.id)) return bidCache.get(d.id);
+        const base = d.cfg.stp && d.cfg.stp[v] !== undefined ? d.cfg.stp[v] : 32768;
+        const mac = (d.ports.find(q => !q.virtual && !q.hidden) || { mac: 'FFFF.FFFF.FFFF' }).mac.toUpperCase();
+        const b = { base, pr: base + v, mac, key: String(base + v).padStart(6, '0') + mac };
+        bidCache.set(d.id, b); return b;
+      };
+      const cost = q => (/^TenGig/.test(q.name) ? 2 : /^Gigabit/.test(q.name) ? 4 : /^Fast/.test(q.name) ? 19 : 100);
+      const chan = q => { const m = (q.extra || []).map(x => x.match(/^channel-group (\d+)/)).find(Boolean); return m ? m[1] : null; };
+      const cmp = (a, b) => { for (let i = 0; i < a.length; i++) { if (a[i] < b[i]) return -1; if (a[i] > b[i]) return 1; } return 0; };
+      const adj = new Map(sws.map(d => [d.id, []]));
+      const bundles = new Map();
+      for (const l of this.p.links) {
+        if (!swSet.has(l.a.dev) || !swSet.has(l.b.dev)) continue;
+        const da = this.dev(l.a.dev), db = this.dev(l.b.dev), pa = NM.findPort(da, l.a.port), pb = NM.findPort(db, l.b.port);
+        if (!pa || !pb || !this.isSwitchPort(da, pa) || !this.isSwitchPort(db, pb)) continue;
+        if (!this.physUp(da, pa) || !this.carriesVlan(da, pa, v) || !this.carriesVlan(db, pb, v)) continue;
+        const ca = chan(pa), cb = chan(pb), ka = da.id + '|' + pa.name, kb = db.id + '|' + pb.name;
+        if (ca && cb) {
+          const k1 = [da.id, ca, db.id, cb].join('#'), k2 = [db.id, cb, da.id, ca].join('#');
+          const b = bundles.get(k1) || bundles.get(k2);
+          if (b) { b.members.push([ka, b.rep[da.id]], [kb, b.rep[db.id]]); continue; }
+          bundles.set(k1, { rep: { [da.id]: ka, [db.id]: kb }, members: [] });
+        }
+        const c = ca && cb ? Math.max(1, Math.floor(cost(pa) / 2)) : cost(pa);
+        adj.get(da.id).push({ port: pa, other: db, oport: pb, cost: c });
+        adj.get(db.id).push({ port: pb, other: da, oport: pa, cost: ca && cb ? c : cost(pb) });
+      }
+      const done = new Set();
+      for (const s0 of sws) {
+        if (done.has(s0.id)) continue;
+        const comp = [], st = [s0]; done.add(s0.id);
+        while (st.length) { const d = st.pop(); comp.push(d); for (const e of adj.get(d.id)) if (!done.has(e.other.id)) { done.add(e.other.id); st.push(e.other); } }
+        const root = comp.reduce((a, b) => (bid(a).key <= bid(b).key ? a : b));
+        const dist = new Map(comp.map(d => [d.id, Infinity])); dist.set(root.id, 0);
+        for (let i = 0; i < comp.length; i++) for (const d of comp) for (const e of adj.get(d.id)) { const nd = dist.get(e.other.id) + e.cost; if (nd < dist.get(d.id)) dist.set(d.id, nd); }
+        for (const d of comp) {
+          let rp = null;
+          if (d !== root) for (const e of adj.get(d.id)) {
+            const cand = [dist.get(e.other.id) + e.cost, bid(e.other).key, e.other.ports.indexOf(e.oport), d.ports.indexOf(e.port)];
+            if (!rp || cmp(cand, rp.cand) < 0) rp = { e, cand };
+          }
+          info.set(d.id, { root: root.id, rootBid: bid(root), bid: bid(d), cost: dist.get(d.id), rootPort: rp ? rp.e.port.name : null, portCost: cost });
+          for (const e of adj.get(d.id)) {
+            const key = d.id + '|' + e.port.name;
+            if (rp && rp.e === e) { state.set(key, 'root'); continue; }
+            const mine = [dist.get(d.id), bid(d).key], theirs = [dist.get(e.other.id), bid(e.other).key];
+            state.set(key, cmp(mine, theirs) < 0 ? 'desg' : 'altn');
+          }
+        }
+      }
+      for (const b of bundles.values()) for (const [k, repKey] of b.members) state.set(k, state.get(repKey) || 'desg');
+      return out;
+    }
+    stpBlocked(d, p, v) { return this.stp(v).state.get(d.id + '|' + p.name) === 'altn'; }
+    /** je port blokovaný STP v některé VLAN, kterou nese? (pro oranžovou kontrolku) */
+    stpBlockedAny(d, p) {
+      if (!d.cfg || !this.isSwitchPort(d, p)) return false;
+      const vl = this.effMode(d, p) === 'access' ? [p.vlan || 1] : Object.keys(d.cfg.vlans).map(Number).filter(v => this.allowed(p, v));
+      return vl.length > 0 && vl.every(v => this.stpBlocked(d, p, v));
+    }
+
+    /* --------------------------- port-security --------------------------- */
+    psecState(d, p) {
+      const key = d.id + '|' + p.name;
+      if (!this.rt.psec.has(key)) this.rt.psec.set(key, { macs: new Set(), violations: 0, last: '' });
+      return this.rt.psec.get(key);
+    }
+    psecAllow(d, p, mac) {
+      const ex = p.extra || [];
+      if (!ex.includes('switchport port-security') || this.effMode(d, p) !== 'access') return true;
+      const mx = ex.map(x => x.match(/^switchport port-security maximum (\d+)/)).find(Boolean);
+      const max = mx ? +mx[1] : 1;
+      const st = this.psecState(d, p);
+      for (const x of ex) { const m = x.match(/^switchport port-security mac-address (?:sticky )?([0-9a-fA-F.]{14})$/); if (m) st.macs.add(m[1].toUpperCase()); }
+      const M = mac.toUpperCase();
+      if (st.macs.has(M)) { st.last = M; return true; }
+      if (st.macs.size < max) {
+        st.macs.add(M); st.last = M;
+        if (ex.includes('switchport port-security mac-address sticky')) { p.extra.push('switchport port-security mac-address sticky ' + M); this._violated = true; }
+        return true;
+      }
+      st.violations++; st.last = M;
+      const mode = (ex.find(x => /^switchport port-security violation/.test(x)) || 'x shutdown').split(' ').pop();
+      if (mode === 'shutdown') { this.rt.errdis.add(d.id + '|' + p.name); this._violated = true; }
+      return false;
+    }
+
+    /* ----------------------------- ACL / NAT ----------------------------- */
+    ifaceAcl(port, dir) {
+      const m = (port.extra || []).map(x => x.match(/^ip access-group (\S+) (in|out)$/)).find(m => m && m[2] === dir);
+      return m ? m[1] : null;
+    }
+    aclPass(d, port, dir, pkt) {
+      if (!d.cfg || !port) return true;
+      const id = this.ifaceAcl(port, dir); if (!id) return true;
+      const acl = NM.aclFind(d.cfg, id); if (!acl || !acl.entries.length) return true;
+      const r = NM.aclMatch(acl, pkt);
+      if (r.index >= 0) { const h = this.aclHits(d, acl); h[r.index] = (h[r.index] || 0) + 1; }
+      return r.action === 'permit';
+    }
+    aclHits(d, acl) { const k = d.id + '|' + acl.id; if (!this.rt.aclHits.has(k)) this.rt.aclHits.set(k, {}); return this.rt.aclHits.get(k); }
+    natRole(port) { const e = (port && port.extra) || []; return e.includes('ip nat inside') ? 'inside' : e.includes('ip nat outside') ? 'outside' : null; }
+    natTable(d) { if (!this.rt.nat.has(d.id)) this.rt.nat.set(d.id, []); return this.rt.nat.get(d.id); }
+    natGlobals(d) {
+      if (!d.cfg || !d.cfg.nat) return [];
+      return d.cfg.nat.statics.map(x => x.global).concat(this.natTable(d).map(t => t.global));
+    }
+    natOutbound(d, pkt) {
+      const nat = d.cfg && d.cfg.nat; if (!nat) return null;
+      const st = nat.statics.find(x => x.local === pkt.src);
+      if (st) return st.global;
+      const tab = this.natTable(d);
+      for (const dy of nat.dynamics) {
+        const acl = NM.aclFind(d.cfg, dy.acl);
+        if (!acl || NM.aclMatch(acl, { src: pkt.src, dst: pkt.dst, proto: 'ip' }).action !== 'permit') continue;
+        let g = null;
+        if (dy.iface) { const q = NM.findPort(d, dy.iface); g = q && q.ip; }
+        else if (dy.pool) {
+          const pool = nat.pools.find(x => x.name === dy.pool); if (!pool) continue;
+          const mine = tab.find(t => t.local === pkt.src && t.pool === dy.pool);
+          if (mine) g = mine.global;
+          else if (dy.overload) g = pool.start;
+          else { const used = new Set(tab.filter(t => t.pool === dy.pool).map(t => t.global)); for (let a = IP.parse(pool.start); a <= IP.parse(pool.end); a++) if (!used.has(IP.str(a))) { g = IP.str(a); break; } }
+        }
+        if (!g) continue;
+        if (!tab.some(t => t.local === pkt.src && t.global === g && t.remote === pkt.dst && t.proto === pkt.proto))
+          tab.push({ local: pkt.src, global: g, remote: pkt.dst, proto: pkt.proto, pool: dy.pool || null, overload: !!dy.overload });
+        if (tab.length > 200) tab.shift();
+        return g;
+      }
+      return null;
+    }
+    natInbound(d, pkt) {
+      const nat = d.cfg && d.cfg.nat; if (!nat) return null;
+      const st = nat.statics.find(x => x.global === pkt.dst);
+      if (st) return st.local;
+      const tab = this.natTable(d);
+      const t = tab.find(x => x.global === pkt.dst && x.remote === pkt.src && x.proto === pkt.proto) || tab.find(x => x.global === pkt.dst && x.pool && !x.overload);
+      return t ? t.local : null;
+    }
+
     /* --------------------------------- IP průchod -------------------------------- */
     /**
      * Pošle IP paket ze zařízení src na dst.
-     * Vrací { ok, reason, at, hops:[iface na vstupu do každého L3 skoku], segments:[[{dev,...}]], ttl, srcIp, dstDev }
+     * Vrací { ok, reason, at, atIp, hops, segments, trace, ttl, srcSeen, dstSeen, dstDev }
+     * trace = seznam L3 skoků (pro krokovou simulaci).
      */
     forward(src, dst, opts) {
       opts = opts || {};
       let ttl = opts.ttl || (src.ios ? 255 : 128);
-      const segments = [], hops = [];
-      let cur = src, srcIp = opts.srcIp || null, arpMiss = false;
-      if (!IP.valid(dst)) return { ok: false, reason: 'badip', segments, hops };
+      const segments = [], hops = [], trace = [];
+      const pkt = { src: opts.srcIp || null, dst, proto: opts.proto || 'icmp', sport: opts.sport || null, dport: opts.dport || null, icmp: opts.icmp || 'echo' };
+      let cur = src, inIf = null, arpMiss = false;
+      const res = o => Object.assign({ segments, hops, trace, srcIp: pkt.src, srcSeen: pkt.src, dstSeen: pkt.dst, ttl, arpMiss, proto: pkt.proto }, o);
+      if (!IP.valid(dst)) return res({ ok: false, reason: 'badip' });
       for (let step = 0; step < 32; step++) {
-        const own = this.owns(cur, dst);
-        if (own) {
-          if (!srcIp) srcIp = own.ip;
-          return { ok: true, at: cur, ttl, segments, hops, srcIp, dstDev: cur, arpMiss };
+        if (cur !== src && inIf) {
+          if (this.natRole(inIf.port) === 'outside') { const l = this.natInbound(cur, pkt); if (l) { trace.push({ note: true, dev: cur.id, text: 'NAT: cílová adresa ' + pkt.dst + ' → ' + l }); pkt.dst = l; } }
+          if (!this.aclPass(cur, inIf.port, 'in', pkt)) return res({ ok: false, reason: 'acl', at: cur, atIp: inIf.ip, acl: this.ifaceAcl(inIf.port, 'in') + ' in na ' + inIf.name });
         }
+        const own = this.owns(cur, pkt.dst);
+        if (own) { if (!pkt.src) pkt.src = own.ip; return res({ ok: true, at: cur, dstDev: cur }); }
         if (cur !== src) {
-          if (!this.canRoute(cur)) return { ok: false, reason: 'drop', at: cur, segments, hops, srcIp };
+          if (!this.canRoute(cur)) return res({ ok: false, reason: 'drop', at: cur });
           ttl--;
-          if (ttl <= 0) return { ok: false, reason: 'ttl', at: cur, segments, hops, srcIp, arpMiss };
+          if (ttl <= 0) return res({ ok: false, reason: 'ttl', at: cur, atIp: inIf && inIf.ip });
         }
-        const r = this.resolve(cur, dst);
-        if (!r) return { ok: false, reason: cur === src ? 'noroute-src' : 'unreachable', at: cur, atIp: hops.length ? hops[hops.length - 1].ip : null, segments, hops, srcIp, arpMiss };
-        if (!srcIp) srcIp = r.iface.ip;
+        const r = this.resolve(cur, pkt.dst);
+        if (!r) return res({ ok: false, reason: cur === src ? 'noroute-src' : 'unreachable', at: cur, atIp: inIf ? inIf.ip : null });
+        if (!pkt.src) pkt.src = r.iface.ip;
+        if (cur !== src && inIf) {
+          if (this.natRole(inIf.port) === 'inside' && this.natRole(r.iface.port) === 'outside') { const g = this.natOutbound(cur, pkt); if (g) { trace.push({ note: true, dev: cur.id, text: 'NAT: zdrojová adresa ' + pkt.src + ' → ' + g }); pkt.src = g; } }
+          if (!this.aclPass(cur, r.iface.port, 'out', pkt)) return res({ ok: false, reason: 'acl', at: cur, atIp: inIf.ip, acl: this.ifaceAcl(r.iface.port, 'out') + ' out na ' + r.iface.name });
+        }
         const ends = this.l2Flood(r.iface);
-        const hit = ends.find(e => e.iface && e.iface.ip === r.nh);
-        if (!hit) {
-          // posbírej kus cesty pro animaci (kam se rámec dostal)
-          return { ok: false, reason: 'arp', at: cur, segments, hops, srcIp, nh: r.nh, arpMiss };
-        }
-        if (!this.arpTable(cur).has(r.nh)) arpMiss = arpMiss || step === 0;
-        this.learn(r.iface, hit.iface, hit.path);
+        const hit = ends.find(e => e.iface && (e.iface.ip === r.nh || (this.natRole(e.iface.port) === 'outside' && this.natGlobals(e.iface.dev).includes(r.nh))));
+        if (!hit) return res({ ok: false, reason: 'arp', at: cur, nh: r.nh, atIp: inIf ? inIf.ip : null, arpFrom: { dev: cur.id, out: r.iface.name, mac: r.iface.mac, ip: r.iface.ip }, flood: ends.map(e => e.path) });
+        const miss = !this.arpTable(cur).has(r.nh);
+        if (miss && step === 0) arpMiss = true;
+        this.learn(r.iface, hit.iface, hit.path, r.nh);
         segments.push(hit.path);
         hops.push({ dev: hit.iface.dev, ip: hit.iface.ip, ingress: hit.iface });
-        if (opts.maxHops && hops.length >= opts.maxHops && hit.iface.dev.ip !== dst) {
-          if (!this.owns(hit.iface.dev, dst)) return { ok: false, reason: 'ttl', at: hit.iface.dev, segments, hops, srcIp, arpMiss };
-        }
-        cur = hit.iface.dev;
+        trace.push({ from: cur.id, to: hit.iface.dev.id, out: r.iface.name, inName: hit.iface.name, srcMac: r.iface.mac, dstMac: hit.iface.mac, nh: r.nh, path: hit.path, ttl, src: pkt.src, dst: pkt.dst, arp: miss, route: r.route, outIp: r.iface.ip });
+        inIf = hit.iface; cur = hit.iface.dev;
       }
-      return { ok: false, reason: 'loop', at: cur, segments, hops, srcIp };
+      return res({ ok: false, reason: 'loop', at: cur });
     }
 
-    /** ICMP echo: { ok, reason, fwd, back, ttl, from } */
-    ping(src, dst) {
-      const fwd = this.forward(src, dst);
-      if (!fwd.ok) return { ok: false, reason: fwd.reason, fwd, from: fwd.at };
-      const back = this.forward(fwd.dstDev, fwd.srcIp, {});
-      if (!back.ok) return { ok: false, reason: 'noreply', fwd, back, from: back.at };
-      return { ok: true, fwd, back, ttl: back.ttl, from: fwd.dstDev, arpMiss: fwd.arpMiss };
+    /** ICMP echo (nebo TCP spojení přes opts.proto/dport): { ok, reason, fwd, back, ttl, from } */
+    ping(src, dst, opts) {
+      opts = opts || {};
+      const fwd = this.forward(src, dst, opts);
+      let out;
+      if (!fwd.ok) out = { ok: false, reason: fwd.reason, fwd, from: fwd.at };
+      else {
+        const back = this.forward(fwd.dstDev, fwd.srcSeen, { srcIp: fwd.dstSeen, icmp: 'reply', proto: opts.proto, sport: opts.dport, dport: opts.sport });
+        if (!back.ok || back.dstDev !== src) out = { ok: false, reason: 'noreply', fwd, back, from: back.at };
+        else out = { ok: true, fwd, back, ttl: back.ttl, from: fwd.dstDev, arpMiss: fwd.arpMiss };
+      }
+      if (this._violated) { this._violated = false; this.touch(); }
+      return out;
     }
 
     /** traceroute: [{ ip, ok }] */
     traceroute(src, dst) {
       const fwd = this.forward(src, dst);
+      const first = fwd.trace.find(t => t.src);
+      const origSrc = first ? first.src : fwd.srcIp;
       const res = [];
       for (const h of fwd.hops) {
-        const back = this.forward(h.dev, fwd.srcIp || '0.0.0.0', {});
+        const back = origSrc ? this.forward(h.dev, origSrc, {}) : { ok: false };
         res.push({ ip: h.ip, ok: back.ok, dev: h.dev });
       }
       if (!fwd.ok) {
-        if (fwd.reason === 'unreachable') res.push({ ip: fwd.at && this.l3Ifaces(fwd.at)[0] ? this.l3Ifaces(fwd.at)[0].ip : '*', ok: true, unreachable: true });
+        if (fwd.reason === 'unreachable' || fwd.reason === 'acl') res.push({ ip: fwd.atIp || '*', ok: !!fwd.atIp, unreachable: true });
         for (let i = 0; i < 3; i++) res.push({ ip: '*', ok: false });
       }
       return { hops: res, ok: fwd.ok, fwd };
