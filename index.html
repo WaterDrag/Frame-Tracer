@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Frame-Tracer</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232563eb'/%3E%3Ccircle cx='9' cy='10' r='3.5' fill='white'/%3E%3Ccircle cx='23' cy='10' r='3.5' fill='white'/%3E%3Ccircle cx='16' cy='23' r='3.5' fill='white'/%3E%3Cpath d='M9 10L23 10L16 23Z' fill='none' stroke='white' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <div class="brand"><svg viewBox="0 0 32 32" width="26" height="26"><rect width="32" height="32" rx="7" fill="var(--accent)"/><circle cx="9" cy="10" r="3.5" fill="#fff"/><circle cx="23" cy="10" r="3.5" fill="#fff"/><circle cx="16" cy="23" r="3.5" fill="#fff"/><path d="M9 10L23 10L16 23Z" fill="none" stroke="#fff" stroke-width="2"/></svg><span>Frame-Tracer</span></div>
+    <nav class="tb-group">
+      <button data-act="new" title="Nový projekt (Ctrl+N)">Nový</button>
+      <button data-act="open" title="Otevřít .pkt / .pka / .ntj (Ctrl+O)">Otevřít</button>
+      <button data-act="savePkt" id="btnSavePkt" title="Uložit do formátu Packet Traceru (Ctrl+S)">Uložit .pkt</button>
+      <button data-act="saveNtj" title="Uložit projekt Frame-Traceru (.ntj)">Uložit projekt</button>
+      <button data-act="exportXml" title="Exportovat dešifrované XML">XML</button>
+    </nav>
+    <nav class="tb-group">
+      <button data-act="undo" title="Zpět (Ctrl+Z)" class="icon">↶</button>
+      <button data-act="redo" title="Znovu (Ctrl+Y)" class="icon">↷</button>
+    </nav>
+    <div class="tb-file" id="fileLabel">Nový projekt</div>
+    <div class="tb-spacer"></div>
+    <div class="seg" id="modeSeg" role="tablist">
+      <button data-mode="realtime" class="on">Realtime</button>
+      <button data-mode="simulation">Simulace</button>
+    </div>
+    <div id="presence" class="presence"></div>
+    <button data-act="backups" title="Zálohy a historie verzí">Zálohy</button>
+    <button data-act="cowork" id="btnCowork" class="primary" title="Spolupráce přes Firebase">Spolupráce</button>
+    <button data-act="theme" class="icon" title="Světlý / tmavý motiv">◐</button>
+  </header>
+
+  <aside id="palette">
+    <section>
+      <h3>Nástroje</h3>
+      <div class="tools">
+        <button data-tool="select" class="on" title="Výběr a přesun (V)"><span>⌖</span>Výběr</button>
+        <button data-tool="pdu" title="Ping mezi dvěma zařízeními (P)"><span>✉</span>Ping</button>
+        <button data-tool="note" title="Poznámka (N)"><span>✎</span>Poznámka</button>
+        <button data-tool="delete" title="Mazání (D)"><span>✕</span>Smazat</button>
+      </div>
+    </section>
+    <section>
+      <h3>Kabely</h3>
+      <div class="tools cables">
+        <button data-cable="auto" title="Automatický kabel – sám vybere typ i volné porty (C)"><i class="cab auto"></i>Auto</button>
+        <button data-cable="straight" title="Přímý (straight-through)"><i class="cab straight"></i>Přímý</button>
+        <button data-cable="cross" title="Křížený (cross-over)"><i class="cab cross"></i>Křížený</button>
+        <button data-cable="serial" title="Sériový DCE"><i class="cab serial"></i>Sériový</button>
+        <button data-cable="fiber" title="Optický"><i class="cab fiber"></i>Optika</button>
+        <button data-cable="console" title="Konzolový"><i class="cab console"></i>Konzole</button>
+      </div>
+    </section>
+    <section id="devicePalette"></section>
+    <p class="hint">Přetáhni zařízení na plochu, nebo ho vyber a klikni. Kolečko = zoom, tažení pozadí = posun.</p>
+  </aside>
+
+  <main id="stage">
+    <svg id="canvas" tabindex="0">
+      <defs id="svgDefs"></defs>
+      <rect id="bg" width="100%" height="100%" fill="url(#grid)"/>
+      <g id="viewport">
+        <g id="lNotes"></g>
+        <g id="lLinks"></g>
+        <g id="lDevices"></g>
+        <g id="lAnim"></g>
+        <g id="lCursors"></g>
+        <rect id="rubber" class="rubber" visibility="hidden"/>
+      </g>
+    </svg>
+    <div class="stage-ctl">
+      <button data-act="zoomIn" title="Přiblížit">+</button>
+      <button data-act="zoomOut" title="Oddálit">−</button>
+      <button data-act="fit" title="Zobrazit vše (F)">⤢</button>
+      <label class="chk" title="Zobrazit IP adresy u zařízení"><input type="checkbox" id="optIps" checked> IP</label>
+      <label class="chk" title="Zobrazit názvy portů u kabelů"><input type="checkbox" id="optPorts"> Porty</label>
+    </div>
+    <div id="toolHint" class="tool-hint" hidden></div>
+    <div id="dropZone" class="drop-zone" hidden><div>Pusť soubor .pkt / .pka / .ntj</div></div>
+  </main>
+
+  <aside id="inspector"></aside>
+
+  <footer id="bottom">
+    <div class="tabs" id="bottomTabs">
+      <button data-btab="pdu" class="on">Pingy (PDU)</button>
+      <button data-btab="events">Události simulace</button>
+      <button data-btab="problems">Diagnostika <b id="probCount"></b></button>
+      <button data-btab="chat" id="chatTab" hidden>Chat</button>
+      <div class="tb-spacer"></div>
+      <label class="chk speed" id="speedBox" hidden>Rychlost <input type="range" id="simSpeed" min="0.25" max="3" step="0.25" value="1"></label>
+      <button data-act="clearPdu" class="small">Vymazat</button>
+    </div>
+    <div class="bpanel" id="bp-pdu"></div>
+    <div class="bpanel" id="bp-events" hidden></div>
+    <div class="bpanel" id="bp-problems" hidden></div>
+    <div class="bpanel" id="bp-chat" hidden><div id="chatLog"></div><form id="chatForm"><input id="chatInput" placeholder="Zpráva týmu…" autocomplete="off"><button>Odeslat</button></form></div>
+  </footer>
+</div>
+
+<div id="portMenu" class="popup" hidden></div>
+<div id="toasts"></div>
+<dialog id="dlg"><form method="dialog" id="dlgForm"></form></dialog>
+<input type="file" id="fileInput" accept=".pkt,.pka,.ntj,.json,.xml" hidden>
+
+<script src="firebase-config.js"></script>
+<script src="js/ptcrypto.js"></script>
+<script src="js/ptxml.js"></script>
+<script src="js/netmodel.js"></script>
+<script src="js/ptformat.js"></script>
+<script src="js/sim.js"></script>
+<script src="js/cli.js"></script>
+<script src="js/icons.js"></script>
+<script src="js/storage.js"></script>
+<script src="js/cowork.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

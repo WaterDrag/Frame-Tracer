@@ -1,0 +1,7 @@
+# soubory, které nepatří do veřejného repozitáře
+tests/pt-check/
+*.pka
+*.pkt
+.claude/
+node_modules/
+.firebase/

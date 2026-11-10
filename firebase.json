@@ -1,0 +1,7 @@
+{
+  "firestore": { "rules": "firestore.rules" },
+  "hosting": {
+    "public": ".",
+    "ignore": ["firebase.json", "firestore.rules", "database.rules.json", "tests/**", "server.js", "*.bat", "**/.*", "**/node_modules/**"]
+  }
+}

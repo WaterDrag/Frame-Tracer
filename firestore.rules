@@ -1,0 +1,15 @@
+rules_version = '2';
+// Pravidla pro Frame-Tracer – vlož do Firebase konzole: Firestore Database → Rules → Publish
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // místnost = 10znakový náhodný kód; přístup jen pro přihlášené (anonymně nebo Googlem)
+    match /rooms/{room} {
+      allow read, write: if request.auth != null && room.size() >= 8;
+      match /{coll}/{doc} {
+        allow read: if request.auth != null && room.size() >= 8;
+        allow write: if request.auth != null && room.size() >= 8
+                     && coll in ['devices', 'links', 'notes', 'pkt', 'presence', 'chat', 'backups'];
+      }
+    }
+  }
+}
